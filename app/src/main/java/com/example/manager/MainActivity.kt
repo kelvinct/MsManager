@@ -86,7 +86,6 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         checkStoragePermission()
 
-        // 初始化 R2 存储
         R2Storage.init(this)
 
         val prefs = getSharedPreferences("MS_PREFS", MODE_PRIVATE)
@@ -341,6 +340,52 @@ class MainActivity : ComponentActivity() {
             getSharedPreferences("MS_PREFS", MODE_PRIVATE).edit()
                 .remove("LAST_${if(isTW) "TW" else "JP"}").apply()
             withContext(Dispatchers.Main) { onComplete() }
+        }
+    }
+
+    // ★★★ 新增：从云端移除本机设备记录 ★★★
+    fun clearMyDeviceFromCloud(onComplete: (Boolean) -> Unit) {
+        val roomCode = getSharedPreferences("MS_PREFS", MODE_PRIVATE).getString("ROOM_CODE", "") ?: ""
+        if (roomCode.isEmpty()) {
+            Toast.makeText(this, "请先设置房间号", Toast.LENGTH_SHORT).show()
+            onComplete(false)
+            return
+        }
+        db.collection("rooms").document(roomCode)
+            .collection("devices").document(myDeviceId)
+            .delete()
+            .addOnSuccessListener {
+                R2Logger.log("Settings", "已从云端移除本机设备记录: $myDeviceName")
+                onComplete(true)
+            }
+            .addOnFailureListener { e ->
+                R2Logger.error("Settings", "移除设备记录失败", e)
+                onComplete(false)
+            }
+    }
+
+    // ★★★ 新增：清理本地所有备份文件（tw + jp）★★★
+    fun clearLocalBackups(onComplete: (Int) -> Unit) {
+        lifecycleScope.launch(Dispatchers.IO) {
+            var deleteCount = 0
+            val paths = listOf(
+                Constant.getBackupPath(true),
+                Constant.getBackupPath(false)
+            )
+            for (path in paths) {
+                val dir = File(path)
+                if (dir.exists()) {
+                    dir.listFiles()?.forEach { file ->
+                        if (file.isFile && file.delete()) {
+                            deleteCount++
+                        }
+                    }
+                }
+            }
+            withContext(Dispatchers.Main) {
+                R2Logger.log("Settings", "清理本地备份: 删除了 $deleteCount 个文件")
+                onComplete(deleteCount)
+            }
         }
     }
 
@@ -600,6 +645,7 @@ fun FileManagerScreen() {
     var showR2LogDialog by remember { mutableStateOf(false) }
     var showResetConfirm by remember { mutableStateOf(false) }
     var showDevicesDialog by remember { mutableStateOf(false) }
+    var showCleanOwnDialog by remember { mutableStateOf(false) }
 
     var showRoomDialog by remember { mutableStateOf(false) }
     var currentRoomCode by remember { mutableStateOf(prefs.getString("ROOM_CODE", "") ?: "") }
@@ -718,6 +764,12 @@ fun FileManagerScreen() {
                                     .setNegativeButton("取消", null)
                                     .show()
                             }
+                        )
+                        Divider()
+                        DropdownMenuItem(
+                            text = { Text("清理本機記錄") },
+                            leadingIcon = { Icon(Icons.Default.DeleteSweep, null) },
+                            onClick = { showCleanOwnDialog = true; showMenu = false }
                         )
                         Divider()
                         DropdownMenuItem(
@@ -866,6 +918,67 @@ fun FileManagerScreen() {
             }
         }
 
+        // --- 清理本機記錄弹窗 ---
+        if (showCleanOwnDialog) {
+            AlertDialog(
+                onDismissRequest = { showCleanOwnDialog = false },
+                title = { Text("清理本機記錄") },
+                text = {
+                    Column {
+                        Text("选择要清理的内容：", fontWeight = FontWeight.Bold)
+                        Spacer(Modifier.height(12.dp))
+
+                        Button(
+                            onClick = {
+                                context.clearMyDeviceFromCloud { success ->
+                                    if (success) {
+                                        Toast.makeText(context, "✅ 已从云端移除本机记录", Toast.LENGTH_SHORT).show()
+                                    } else {
+                                        Toast.makeText(context, "❌ 移除失败", Toast.LENGTH_SHORT).show()
+                                    }
+                                }
+                                showCleanOwnDialog = false
+                            },
+                            modifier = Modifier.fillMaxWidth(),
+                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF1976D2))
+                        ) {
+                            Icon(Icons.Default.CloudOff, null)
+                            Spacer(Modifier.width(8.dp))
+                            Text("從雲端移除本機（保留雲端檔案）")
+                        }
+
+                        Spacer(Modifier.height(8.dp))
+
+                        Button(
+                            onClick = {
+                                AlertDialog.Builder(context)
+                                    .setTitle("確認清理本地")
+                                    .setMessage("將刪除本機 msaccount2/tw 和 jp 下的所有 .bin 檔案。\n\n⚠️ 此操作不可恢復！雲端檔案不受影響。")
+                                    .setPositiveButton("確定刪除") { _, _ ->
+                                        context.clearLocalBackups { count ->
+                                            Toast.makeText(context, "✅ 已刪除 $count 個本地檔案", Toast.LENGTH_LONG).show()
+                                            refreshList()
+                                        }
+                                        showCleanOwnDialog = false
+                                    }
+                                    .setNegativeButton("取消", null)
+                                    .show()
+                            },
+                            modifier = Modifier.fillMaxWidth(),
+                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFD32F2F))
+                        ) {
+                            Icon(Icons.Default.DeleteSweep, null)
+                            Spacer(Modifier.width(8.dp))
+                            Text("清理本地備份（雲端不受影響）")
+                        }
+                    }
+                },
+                confirmButton = {
+                    TextButton(onClick = { showCleanOwnDialog = false }) { Text("關閉") }
+                }
+            )
+        }
+
         // --- R2 日志弹窗 ---
         if (showR2LogDialog) {
             AlertDialog(
@@ -875,11 +988,7 @@ fun FileManagerScreen() {
                     if (R2Logger.logs.isEmpty()) {
                         Text("暂无日志。\n\n请先尝试上传一次文件，再回来看。", color = Color.Gray)
                     } else {
-                        Box(
-                            modifier = Modifier
-                                .heightIn(max = 500.dp)
-                                .verticalScroll(rememberScrollState())
-                        ) {
+                        Box(modifier = Modifier.heightIn(max = 500.dp).verticalScroll(rememberScrollState())) {
                             Text(
                                 text = R2Logger.logs.joinToString("\n\n"),
                                 fontSize = 10.sp,
@@ -894,11 +1003,7 @@ fun FileManagerScreen() {
                 },
                 dismissButton = {
                     Row {
-                        TextButton(onClick = {
-                            R2Logger.clear()
-                            showR2LogDialog = false
-                        }) { Text("清空") }
-
+                        TextButton(onClick = { R2Logger.clear(); showR2LogDialog = false }) { Text("清空") }
                         TextButton(onClick = {
                             val path = R2Logger.saveToFile()
                             if (path != null) {
