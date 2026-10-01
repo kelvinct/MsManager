@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- 1. 蓝色圆角背景 (由于 vector 画圆角矩形较复杂，这里用简单的矩形代替) -->
+    <path
+        android:fillColor="#1E88E5"
+        android:pathData="M0,0h108v108h-108z" />
+
+    <!-- 2. 右上角的红色 Bug 徽章背景 -->
+    <path
+        android:fillColor="#FF5252"
+        android:pathData="M86,2 A20,20 0 1,1 85.99,2 Z" />
+
+    <!-- 3. Bug 的身体 (黑色椭圆) -->
+    <path
+        android:fillColor="#212121"
+        android:pathData="M86,12 A8,10 0 1,1 85.99,12 Z" />
+
+    <!-- 4. Bug 的翅膀分割线 (白色细线) -->
+    <path
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="1.5"
+        android:strokeLineCap="round"
+        android:pathData="M86,12 L86,32" />
+
+    <!-- 5. Bug 的头部 (黑色圆圈) -->
+    <path
+        android:fillColor="#212121"
+        android:pathData="M86,5.5 A4.5,4.5 0 1,1 85.99,5.5 Z" />
+
+    <!-- 6. Bug 的触角 (黑色曲线) -->
+    <path
+        android:strokeColor="#212121"
+        android:strokeWidth="2"
+        android:strokeLineCap="round"
+        android:pathData="M83,7 Q79,3 76,5 M89,7 Q93,3 96,5" />
+
+    <!-- 7. Bug 的腿 (左右各三条) -->
+    <path
+        android:strokeColor="#212121"
+        android:strokeWidth="2"
+        android:strokeLineCap="round"
+        android:pathData="M78,17 L72,14 M78,22 L70,22 M78,27 L72,30 M94,17 L100,14 M94,22 L102,22 M94,27 L100,30" />
+</vector>

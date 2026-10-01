@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "322085170277",
+    "project_id": "ms-manager-4dfc2",
+    "storage_bucket": "ms-manager-4dfc2.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:322085170277:android:06cb092a2f976024be6a8c",
+        "android_client_info": {
+          "package_name": "com.example.manager"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyCUYheZhYnOv3hq0ucSABmP9DjmadOHyKs"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
