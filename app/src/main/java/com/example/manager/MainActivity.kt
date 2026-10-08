@@ -42,6 +42,7 @@ import com.example.manager.models.AccountModel
 import com.example.manager.utils.LinuxCommander
 import com.example.manager.utils.R2Logger
 import com.example.manager.utils.R2Storage
+import com.example.manager.utils.RoomLock
 import com.google.firebase.auth.FirebaseAuth
 import com.google.firebase.firestore.FirebaseFirestore
 import com.google.firebase.firestore.ListenerRegistration
@@ -75,9 +76,12 @@ class MainActivity : ComponentActivity() {
     private lateinit var db: FirebaseFirestore
     private var cloudListener: ListenerRegistration? = null
     private var devicesListener: ListenerRegistration? = null
+    private var lockListener: ListenerRegistration? = null
 
     var cloudState by mutableStateOf<Map<String, AccountModel>>(emptyMap())
     var allDeviceSelections by mutableStateOf<List<DeviceSelection>>(emptyList())
+    // ★ 每個帳號獨立鎖
+    var currentLocks by mutableStateOf<Map<String, RoomLock.LockInfo>>(emptyMap())
 
     lateinit var myDeviceId: String
     lateinit var myDeviceName: String
@@ -95,6 +99,9 @@ class MainActivity : ComponentActivity() {
         myDeviceName = prefs.getString("DEVICE_NAME", null) ?: Build.MODEL.also {
             prefs.edit().putString("DEVICE_NAME", it).apply()
         }
+
+        // ★ 立即載入本地鎖快取（開 App 唔會空等）
+        currentLocks = RoomLock.loadLocalCache(this)
 
         auth = FirebaseAuth.getInstance()
         db = FirebaseFirestore.getInstance()
@@ -133,7 +140,7 @@ class MainActivity : ComponentActivity() {
     private fun intToBytes(value: Int): ByteArray = byteArrayOf((value shr 24).toByte(), (value shr 16).toByte(), (value shr 8).toByte(), value.toByte())
     private fun bytesToInt(b: ByteArray): Int = if (b.size < 4) 0 else (b[0].toInt() shl 24) or ((b[1].toInt() and 0xff) shl 16) or ((b[2].toInt() and 0xff) shl 8) or (b[3].toInt() and 0xff)
 
-    // ==================== 本地备份与恢复 ====================
+    // ==================== 本地備份與恢復 ====================
 
     fun saveMergedAccount(name: String?, existingFullName: String?, isTW: Boolean, onComplete: (Boolean) -> Unit) {
         if (isProcessing) return
@@ -268,12 +275,35 @@ class MainActivity : ComponentActivity() {
                         setLastUsedTime(System.currentTimeMillis())
                     }
                     val newFile = File(root, m.toFullName())
-                    if (backupFile.renameTo(newFile)) {
+// ★ 如果係同一個檔案名，唔需要重命名
+                    if (backupFile.absolutePath != newFile.absolutePath) {
+                        // ★ 先檢查目標檔案，如果已存在就刪除（避免 rename 失敗）
+                        if (newFile.exists()) {
+                            Log.w("MS_SWITCH", "目標檔案已存在，先刪除: ${newFile.name}")
+                            newFile.delete()
+                        }
+
+                        // ★ 嘗試 rename
+                        val renamed = backupFile.renameTo(newFile)
+                        if (!renamed) {
+                            // ★ Rename 失敗 → 用 copy + delete 代替
+                            Log.w("MS_SWITCH", "renameTo 失敗，改用 copy+delete")
+                            try {
+                                backupFile.copyTo(newFile, overwrite = true)
+                                backupFile.delete()
+                                Log.d("MS_SWITCH", "copy+delete 成功: ${newFile.name}")
+                            } catch (e: Exception) {
+                                Log.e("MS_SWITCH", "copy+delete 失敗", e)
+                            }
+                        }
+
+                        // ★ 更新 SharedPreferences
                         getSharedPreferences("MS_PREFS", MODE_PRIVATE).edit()
                             .putString("LAST_${if (isTW) "TW" else "JP"}", m.getName()).apply()
                     }
-                    success = true
 
+// ★ 無論 rename 成功與否，都應該 success = true（因為切換本身成功）
+                    success = true
                     val roomCode = getSharedPreferences("MS_PREFS", MODE_PRIVATE).getString("ROOM_CODE", "") ?: ""
                     val gameId = if (isTW) "monst_tw" else "monst_jp"
                     if (roomCode.isNotEmpty()) {
@@ -288,8 +318,53 @@ class MainActivity : ComponentActivity() {
                 isProcessing = false
                 withContext(Dispatchers.Main) {
                     lastOperationLog = logMsg.toString()
-                    if (!success) AlertDialog.Builder(this@MainActivity).setTitle("恢复失败，日志如下").setMessage(logMsg.toString()).setPositiveButton("确定", null).show()
+                    if (!success) AlertDialog.Builder(this@MainActivity).setTitle("恢复失败").setMessage(logMsg.toString()).setPositiveButton("确定", null).show()
                     onComplete(success)
+                }
+            }
+        }
+    }
+
+    // ★★★ 嘗試上鎖後切換（每帳號獨立鎖 + 異步 unlock）★★★
+    fun tryLockAndSwitch(fullName: String, isTW: Boolean, onResult: (Boolean, String) -> Unit) {
+        val roomCode = getSharedPreferences("MS_PREFS", MODE_PRIVATE).getString("ROOM_CODE", "") ?: ""
+        if (roomCode.isEmpty()) {
+            switchMergedAccount(fullName, isTW) { onResult(it, "") }
+            return
+        }
+
+        val model = AccountModel.fromFullName(fullName)
+        val gameId = if (isTW) "monst_tw" else "monst_jp"
+
+        lifecycleScope.launch(Dispatchers.IO) {
+            val errorMsg = RoomLock.tryLock(db, roomCode, myDeviceId, myDeviceName, model.getName(), gameId)
+
+            withContext(Dispatchers.Main) {
+                if (errorMsg == null) {
+                    // ★ 上鎖成功 → 切換
+                    switchMergedAccount(fullName, isTW) { success ->
+                        // ★ unlock 完全異步，唔阻塞回調
+                        lifecycleScope.launch(Dispatchers.IO) {
+                            RoomLock.unlock(db, roomCode, myDeviceId, model.getName(), gameId)
+                        }
+                        onResult(success, "")
+                    }
+                } else {
+                    val parts = errorMsg.split("|")
+                    val errorType = parts.getOrNull(0) ?: "UNKNOWN"
+                    val userMsg = when (errorType) {
+                        "LOCKED_BY" -> {
+                            val holderName = parts.getOrNull(1) ?: "其他設備"
+                            val accName = parts.getOrNull(2) ?: ""
+                            "🔒 $holderName 正在使用「$accName」，請選其他帳號"
+                        }
+                        "COOLDOWN" -> {
+                            val remaining = parts.getOrNull(1) ?: "30"
+                            "⏱️ 冷卻中，請等 $remaining 秒後再試"
+                        }
+                        else -> "❌ 無法切換：$errorMsg"
+                    }
+                    onResult(false, userMsg)
                 }
             }
         }
@@ -343,7 +418,6 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    // ★★★ 新增：从云端移除本机设备记录 ★★★
     fun clearMyDeviceFromCloud(onComplete: (Boolean) -> Unit) {
         val roomCode = getSharedPreferences("MS_PREFS", MODE_PRIVATE).getString("ROOM_CODE", "") ?: ""
         if (roomCode.isEmpty()) {
@@ -364,7 +438,6 @@ class MainActivity : ComponentActivity() {
             }
     }
 
-    // ★★★ 新增：清理本地所有备份文件（tw + jp）★★★
     fun clearLocalBackups(onComplete: (Int) -> Unit) {
         lifecycleScope.launch(Dispatchers.IO) {
             var deleteCount = 0
@@ -389,7 +462,7 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    // ==================== R2 文件上传/下载 ====================
+    // ==================== R2 文件上傳/下載 ====================
 
     private suspend fun uploadFileToStorage(roomCode: String, gameId: String, accountName: String, localFile: File): Boolean {
         val key = "rooms/$roomCode/files/${gameId}_${accountName}.bin"
@@ -574,7 +647,7 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    // ==================== 云端同步 ====================
+    // ==================== 雲端同步 ====================
 
     fun listenToCloud(roomCode: String, gameId: String, onCloudData: (List<AccountModel>) -> Unit) {
         if (roomCode.isEmpty()) return
@@ -604,6 +677,17 @@ class MainActivity : ComponentActivity() {
             }
     }
 
+    // ★ 監聽整個 locks 集合（含本地快取同步）
+    fun listenToLocks(roomCode: String, gameId: String) {
+        if (roomCode.isEmpty()) return
+        lockListener?.remove()
+        lockListener = RoomLock.listenLocks(db, roomCode, gameId) { locks ->
+            currentLocks = locks
+            // ★ 同步到本地快取
+            RoomLock.saveLocalCache(this, locks)
+        }
+    }
+
     fun updateMySelection(roomCode: String, gameId: String, accountName: String) {
         if (roomCode.isEmpty()) return
         val data = DeviceSelection(
@@ -624,6 +708,7 @@ class MainActivity : ComponentActivity() {
         super.onDestroy()
         cloudListener?.remove()
         devicesListener?.remove()
+        lockListener?.remove()
     }
 }
 
@@ -636,6 +721,8 @@ fun FileManagerScreen() {
     val prefs = context.getSharedPreferences("MS_PREFS", Context.MODE_PRIVATE)
     var isTW by remember { mutableStateOf(prefs.getBoolean("SAVED_IS_TW", true)) }
     var isDeleteLocked by remember { mutableStateOf(true) }
+    var isRefreshing by remember { mutableStateOf(false) }
+
     var showAddDialog by remember { mutableStateOf(false) }
     var showRenameDialog by remember { mutableStateOf(false) }
     var showDeleteConfirm by remember { mutableStateOf(false) }
@@ -661,15 +748,50 @@ fun FileManagerScreen() {
     var lastActiveName by remember(isTW) { mutableStateOf(prefs.getString("LAST_${if(isTW) "TW" else "JP"}", "") ?: "") }
 
     fun refreshList() {
-        val root = File(Constant.getBackupPath(isTW))
-        if (!root.exists()) root.mkdirs()
-        backupList.clear()
-        val list = root.list()?.toMutableList() ?: mutableListOf()
-        list.sortBy { it.lowercase() }
-        backupList.addAll(list)
-        lastActiveName = prefs.getString("LAST_${if(isTW) "TW" else "JP"}", "") ?: ""
-    }
+        if (isRefreshing) {
+            Log.d("MS_REFRESH", "跳過並發刷新")
+            return
+        }
+        isRefreshing = true
+        try {
+            val root = File(Constant.getBackupPath(isTW))
+            if (!root.exists()) root.mkdirs()
 
+            val rawList = root.list()?.toList() ?: emptyList()
+
+            // 按「帳號名」去重（保留修改時間最新嘅）
+            val seen = mutableSetOf<String>()
+            val uniqueList = rawList
+                .map { File(root, it) }
+                .filter { it.isFile }
+                .sortedByDescending { it.lastModified() }
+                .filter { file ->
+                    val name = AccountModel.fromFullName(file.name).getName()
+                    seen.add(name)
+                }
+                .map { it.name }
+                .sortedBy { it.lowercase() }
+
+            backupList.clear()
+            backupList.addAll(uniqueList)
+            lastActiveName = prefs.getString("LAST_${if(isTW) "TW" else "JP"}", "") ?: ""
+
+            // 自動清理重複檔
+            if (uniqueList.size < rawList.size) {
+                val keepNames = uniqueList.toSet()
+                rawList.filter { it !in keepNames }.forEach { oldName ->
+                    try {
+                        File(root, oldName).delete()
+                        Log.d("MS_DEDUP", "已刪除重複: $oldName")
+                    } catch (e: Exception) {
+                        Log.e("MS_DEDUP", "刪除失敗", e)
+                    }
+                }
+            }
+        } finally {
+            isRefreshing = false
+        }
+    }
     LaunchedEffect(isTW, currentRoomCode) {
         prefs.edit().putBoolean("SAVED_IS_TW", isTW).apply()
         refreshList()
@@ -680,6 +802,7 @@ fun FileManagerScreen() {
                 Log.d("Firebase", "云端数据更新: ${cloudAccounts.size} 个账号")
             }
             context.listenToDevices(currentRoomCode, currentGameId)
+            context.listenToLocks(currentRoomCode, currentGameId)
         }
     }
 
@@ -696,11 +819,8 @@ fun FileManagerScreen() {
                 title = { Text(if (isTW) "MS管理 (台)" else "MS管理 (日)") },
                 actions = {
                     IconButton(onClick = { showR2LogDialog = true }) {
-                        Icon(
-                            Icons.Default.Cloud,
-                            contentDescription = "R2日志",
-                            tint = if (R2Logger.logs.isNotEmpty()) Color(0xFF2196F3) else Color.Unspecified
-                        )
+                        Icon(Icons.Default.Cloud, "R2日志",
+                            tint = if (R2Logger.logs.isNotEmpty()) Color(0xFF2196F3) else Color.Unspecified)
                     }
                     IconButton(onClick = { showDevicesDialog = true }) {
                         BadgedBox(badge = {
@@ -725,12 +845,12 @@ fun FileManagerScreen() {
                                 showMenu = false
                                 AlertDialog.Builder(context)
                                     .setTitle("批量上传")
-                                    .setMessage("将上传 ${backupList.size} 个账号的完整文件到 R2。\n\n⚠️ 每个文件约 28MB，请确保网络稳定。")
+                                    .setMessage("将上传 ${backupList.size} 个账号。\n\n⚠️ 每个约 28MB\n\n确定？")
                                     .setPositiveButton("开始") { _, _ ->
                                         context.uploadAllToCloud(isTW) { success, fail ->
                                             AlertDialog.Builder(context)
                                                 .setTitle("批量上传完成")
-                                                .setMessage("成功: $success 个\n失败: $fail 个\n\n详情请点顶部 ☁️ 图标查看日志。")
+                                                .setMessage("成功: $success 个\n失败: $fail 个")
                                                 .setPositiveButton("确定", null)
                                                 .show()
                                         }
@@ -746,7 +866,7 @@ fun FileManagerScreen() {
                                 showMenu = false
                                 AlertDialog.Builder(context)
                                     .setTitle("从云端恢复")
-                                    .setMessage("将从 R2 下载所有账号文件到本地。\n\n⚠️ 每个文件约 28MB，请确保 WIFI 环境。\n\n已存在的账号会自动跳过。")
+                                    .setMessage("将从 R2 下载所有账号文件。\n\n⚠️ 每个约 28MB\n\n已存在的会自动跳过。")
                                     .setPositiveButton("开始") { _, _ ->
                                         context.restoreAllFromCloud(isTW,
                                             onProgress = { current, total, name ->
@@ -755,7 +875,7 @@ fun FileManagerScreen() {
                                             onComplete = { success, fail, skip ->
                                                 AlertDialog.Builder(context)
                                                     .setTitle("从云端恢复完成")
-                                                    .setMessage("成功: $success 个（其中跳过 $skip 个）\n失败: $fail 个")
+                                                    .setMessage("成功: $success (跳过 $skip)\n失败: $fail")
                                                     .setPositiveButton("确定") { _, _ -> refreshList() }
                                                     .show()
                                             }
@@ -771,7 +891,6 @@ fun FileManagerScreen() {
                             leadingIcon = { Icon(Icons.Default.DeleteSweep, null) },
                             onClick = { showCleanOwnDialog = true; showMenu = false }
                         )
-                        Divider()
                         DropdownMenuItem(
                             text = { Text("重置所有顏色") },
                             leadingIcon = { Icon(Icons.Default.Refresh, null) },
@@ -819,6 +938,11 @@ fun FileManagerScreen() {
                     val cloudModel = context.cloudState[localModel.getName()]
                     val model = if (cloudModel != null && cloudModel.getLastUsedTime() > localModel.getLastUsedTime()) cloudModel else localModel
 
+                    // ★ 每個帳號獨立鎖
+                    val lock = context.currentLocks[model.getName()]
+                    val isLockedByOther = lock != null
+                            && lock.holderDeviceId != context.myDeviceId
+
                     val isLast = model.getName() == lastActiveName
                     val otherDevicesUsingThis = context.allDeviceSelections.filter {
                         it.deviceId != context.myDeviceId && it.selectedAccount == model.getName()
@@ -827,6 +951,7 @@ fun FileManagerScreen() {
                     val isUsed = model.isUsedToday()
 
                     val cardColor = when {
+                        isLockedByOther -> Color(0xFFBDBDBD)
                         isLast -> Color(0xFF2196F3)
                         isUsed -> Color(0xFFFFEE58)
                         else -> Color(0xFFA5D6A7)
@@ -834,8 +959,13 @@ fun FileManagerScreen() {
 
                     val dismissState = rememberSwipeToDismissBoxState(confirmValueChange = {
                         if (it == SwipeToDismissBoxValue.EndToStart) {
-                            if (isDeleteLocked) { Toast.makeText(context, "鎖定中", Toast.LENGTH_SHORT).show(); false }
-                            else { accountToDelete = fullName; showDeleteConfirm = true; false }
+                            if (isLockedByOther) {
+                                Toast.makeText(context, "🔒 被鎖定中，無法刪除", Toast.LENGTH_SHORT).show(); false
+                            } else if (isDeleteLocked) {
+                                Toast.makeText(context, "鎖定中", Toast.LENGTH_SHORT).show(); false
+                            } else {
+                                accountToDelete = fullName; showDeleteConfirm = true; false
+                            }
                         } else false
                     })
 
@@ -849,15 +979,19 @@ fun FileManagerScreen() {
                         Card(colors = CardDefaults.cardColors(containerColor = cardColor),
                             modifier = Modifier.fillMaxWidth().padding(8.dp).combinedClickable(
                                 onClick = {
-                                    lastActiveName = model.getName()
-                                    val localKey = "LAST_${if(isTW) "TW" else "JP"}"
-                                    prefs.edit()
-                                        .putString(localKey, model.getName())
-                                        .putLong("${localKey}_TIME", System.currentTimeMillis())
-                                        .apply()
-                                    context.switchMergedAccount(fullName, isTW) { success -> if (success) refreshList() }
+                                    if (isLockedByOther) {
+                                        Toast.makeText(context, "🔒 ${lock!!.holderDeviceName} 正在使用此帳號", Toast.LENGTH_SHORT).show()
+                                        return@combinedClickable
+                                    }
+                                    // ★ 樂觀更新：立即變藍，Firestore 背景跑
+                                    doSwitch(context, model, fullName, isTW, prefs, ::refreshList)
                                 },
-                                onLongClick = { accountToRename = fullName; renameInput = model.getName(); showRenameDialog = true }
+                                onLongClick = {
+                                    if (isLockedByOther) return@combinedClickable
+                                    accountToRename = fullName
+                                    renameInput = model.getName()
+                                    showRenameDialog = true
+                                }
                             )) {
                             Row(modifier = Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
                                 if (isLast) Icon(Icons.AutoMirrored.Filled.ArrowForward, null, tint = Color.White, modifier = Modifier.padding(end = 8.dp))
@@ -867,6 +1001,11 @@ fun FileManagerScreen() {
                                         color = if (isLast) Color.White else Color.Black)
                                     Text("次數: ${model.getFrequency()} | ${sdf.format(Date(model.getLastUsedTime()))}",
                                         fontSize = 12.sp, color = if (isLast) Color.LightGray else Color.DarkGray)
+
+                                    if (isLockedByOther) {
+                                        Text("🔒 ${lock!!.holderDeviceName} 使用中",
+                                            fontSize = 11.sp, color = Color(0xFFD32F2F), fontWeight = FontWeight.Bold)
+                                    }
 
                                     if (otherDevicesUsingThis.isNotEmpty()) {
                                         val names = otherDevicesUsingThis.joinToString(", ") { it.deviceName }
@@ -880,12 +1019,21 @@ fun FileManagerScreen() {
                                     }
                                 }
 
+                                if (isLockedByOther) {
+                                    Icon(Icons.Default.Lock, "被鎖", tint = Color(0xFF616161))
+                                    Spacer(Modifier.width(8.dp))
+                                }
+
                                 if (otherDevicesUsingThis.isNotEmpty()) {
                                     Box(modifier = Modifier.size(10.dp).background(Color(0xFFFF9800), shape = MaterialTheme.shapes.small))
                                     Spacer(Modifier.width(8.dp))
                                 }
 
                                 IconButton(onClick = {
+                                    if (isLockedByOther) {
+                                        Toast.makeText(context, "🔒 被鎖定中", Toast.LENGTH_SHORT).show()
+                                        return@IconButton
+                                    }
                                     if (currentRoomCode.isEmpty()) {
                                         Toast.makeText(context, "请先设置房间号", Toast.LENGTH_SHORT).show()
                                         showRoomDialog = true
@@ -927,55 +1075,43 @@ fun FileManagerScreen() {
                     Column {
                         Text("选择要清理的内容：", fontWeight = FontWeight.Bold)
                         Spacer(Modifier.height(12.dp))
-
                         Button(
                             onClick = {
                                 context.clearMyDeviceFromCloud { success ->
-                                    if (success) {
-                                        Toast.makeText(context, "✅ 已从云端移除本机记录", Toast.LENGTH_SHORT).show()
-                                    } else {
-                                        Toast.makeText(context, "❌ 移除失败", Toast.LENGTH_SHORT).show()
-                                    }
+                                    Toast.makeText(context, if (success) "✅ 已移除" else "❌ 失敗", Toast.LENGTH_SHORT).show()
                                 }
                                 showCleanOwnDialog = false
                             },
                             modifier = Modifier.fillMaxWidth(),
                             colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF1976D2))
                         ) {
-                            Icon(Icons.Default.CloudOff, null)
-                            Spacer(Modifier.width(8.dp))
-                            Text("從雲端移除本機（保留雲端檔案）")
+                            Icon(Icons.Default.CloudOff, null); Spacer(Modifier.width(8.dp))
+                            Text("從雲端移除本機")
                         }
-
                         Spacer(Modifier.height(8.dp))
-
                         Button(
                             onClick = {
                                 AlertDialog.Builder(context)
-                                    .setTitle("確認清理本地")
-                                    .setMessage("將刪除本機 msaccount2/tw 和 jp 下的所有 .bin 檔案。\n\n⚠️ 此操作不可恢復！雲端檔案不受影響。")
-                                    .setPositiveButton("確定刪除") { _, _ ->
+                                    .setTitle("確認清理")
+                                    .setMessage("將刪除本機所有 .bin 檔案。\n\n⚠️ 雲端不受影響")
+                                    .setPositiveButton("確定") { _, _ ->
                                         context.clearLocalBackups { count ->
-                                            Toast.makeText(context, "✅ 已刪除 $count 個本地檔案", Toast.LENGTH_LONG).show()
+                                            Toast.makeText(context, "✅ 已刪除 $count 個", Toast.LENGTH_LONG).show()
                                             refreshList()
                                         }
                                         showCleanOwnDialog = false
                                     }
-                                    .setNegativeButton("取消", null)
-                                    .show()
+                                    .setNegativeButton("取消", null).show()
                             },
                             modifier = Modifier.fillMaxWidth(),
                             colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFD32F2F))
                         ) {
-                            Icon(Icons.Default.DeleteSweep, null)
-                            Spacer(Modifier.width(8.dp))
-                            Text("清理本地備份（雲端不受影響）")
+                            Icon(Icons.Default.DeleteSweep, null); Spacer(Modifier.width(8.dp))
+                            Text("清理本地備份")
                         }
                     }
                 },
-                confirmButton = {
-                    TextButton(onClick = { showCleanOwnDialog = false }) { Text("關閉") }
-                }
+                confirmButton = { TextButton(onClick = { showCleanOwnDialog = false }) { Text("關閉") } }
             )
         }
 
@@ -983,34 +1119,24 @@ fun FileManagerScreen() {
         if (showR2LogDialog) {
             AlertDialog(
                 onDismissRequest = { showR2LogDialog = false },
-                title = { Text("R2 上传日志 (共 ${R2Logger.logs.size} 条)") },
+                title = { Text("R2 日志 (${R2Logger.logs.size})") },
                 text = {
                     if (R2Logger.logs.isEmpty()) {
-                        Text("暂无日志。\n\n请先尝试上传一次文件，再回来看。", color = Color.Gray)
+                        Text("暂无日志", color = Color.Gray)
                     } else {
                         Box(modifier = Modifier.heightIn(max = 500.dp).verticalScroll(rememberScrollState())) {
-                            Text(
-                                text = R2Logger.logs.joinToString("\n\n"),
-                                fontSize = 10.sp,
-                                fontFamily = FontFamily.Monospace,
-                                color = Color.Black
-                            )
+                            Text(R2Logger.logs.joinToString("\n\n"), fontSize = 10.sp,
+                                fontFamily = FontFamily.Monospace, color = Color.Black)
                         }
                     }
                 },
-                confirmButton = {
-                    TextButton(onClick = { showR2LogDialog = false }) { Text("关闭") }
-                },
+                confirmButton = { TextButton(onClick = { showR2LogDialog = false }) { Text("关闭") } },
                 dismissButton = {
                     Row {
                         TextButton(onClick = { R2Logger.clear(); showR2LogDialog = false }) { Text("清空") }
                         TextButton(onClick = {
                             val path = R2Logger.saveToFile()
-                            if (path != null) {
-                                Toast.makeText(context, "✅ 日志已保存到:\n$path", Toast.LENGTH_LONG).show()
-                            } else {
-                                Toast.makeText(context, "❌ 保存失败，请检查存储权限", Toast.LENGTH_SHORT).show()
-                            }
+                            Toast.makeText(context, if (path != null) "✅ 已保存:\n$path" else "❌ 失败", Toast.LENGTH_LONG).show()
                         }) { Text("导出", color = Color(0xFF2196F3)) }
                     }
                 }
@@ -1024,6 +1150,23 @@ fun FileManagerScreen() {
                 title = { Text("在线设备监控") },
                 text = {
                     Column(modifier = Modifier.verticalScroll(rememberScrollState())) {
+                        // 顯示所有鎖
+                        val locks = context.currentLocks
+                        if (locks.isNotEmpty()) {
+                            Surface(color = Color(0xFFFFF3E0),
+                                modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp),
+                                shape = MaterialTheme.shapes.medium) {
+                                Column(modifier = Modifier.padding(12.dp)) {
+                                    Text("🔒 當前鎖定：", fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                                    locks.forEach { (accName, lockInfo) ->
+                                        val isMine = lockInfo.holderDeviceId == context.myDeviceId
+                                        Text("• $accName → ${lockInfo.holderDeviceName}${if (isMine) " (你)" else ""}",
+                                            fontSize = 12.sp, color = if (isMine) Color(0xFF1976D2) else Color(0xFFD32F2F))
+                                    }
+                                }
+                            }
+                        }
+
                         if (context.allDeviceSelections.isEmpty()) {
                             Text("目前没有其他设备在线。", color = Color.Gray)
                         } else {
@@ -1057,9 +1200,10 @@ fun FileManagerScreen() {
                 title = { Text("设置同步房间号") },
                 text = {
                     Column {
-                        Text("3台设备输入相同的房间号即可同步数据。", fontSize = 12.sp, color = Color.Gray)
+                        Text("3台设备输入相同的房间号即可同步。", fontSize = 12.sp, color = Color.Gray)
                         Spacer(Modifier.height(8.dp))
-                        TextField(value = roomInput, onValueChange = { roomInput = it }, singleLine = true, placeholder = { Text("例如 888888") })
+                        TextField(value = roomInput, onValueChange = { roomInput = it },
+                            singleLine = true, placeholder = { Text("例如 888888") })
                     }
                 },
                 confirmButton = {
@@ -1067,7 +1211,7 @@ fun FileManagerScreen() {
                         currentRoomCode = roomInput.trim()
                         prefs.edit().putString("ROOM_CODE", currentRoomCode).apply()
                         showRoomDialog = false
-                    }) { Text("保存并连接") }
+                    }) { Text("保存") }
                 },
                 dismissButton = { TextButton(onClick = { showRoomDialog = false }) { Text("取消") } }
             )
@@ -1080,13 +1224,13 @@ fun FileManagerScreen() {
                 confirmButton = { Button(onClick = {
                     if (renameInput.trim().isNotEmpty() && !backupList.any { AccountModel.fromFullName(it).getName().equals(renameInput.trim(), true) }) {
                         context.renameAccount(accountToRename, renameInput.trim(), isTW) { refreshList(); showRenameDialog = false }
-                    } else { Toast.makeText(context, "名稱重複或無效", Toast.LENGTH_SHORT).show() }
+                    } else { Toast.makeText(context, "名稱重複", Toast.LENGTH_SHORT).show() }
                 }) { Text("確定") } })
         }
 
         if (showAboutDialog) {
             AlertDialog(onDismissRequest = { showAboutDialog = false }, title = { Text("關於") },
-                text = { Text("Google AI Design with KK\n\n支援 Android 8.0+\n合併封裝：data10 + data13\n雲端存儲：Cloudflare R2") },
+                text = { Text("MS管理工具\n\n支援 Android 8.0+\n每帳號獨立鎖 + 冷卻期\n樂觀 UI 更新\n雲端存儲：Cloudflare R2") },
                 confirmButton = { TextButton(onClick = { showAboutDialog = false }) { Text("OK") } })
         }
 
@@ -1101,34 +1245,62 @@ fun FileManagerScreen() {
         }
 
         if (showDeleteConfirm) {
-            AlertDialog(onDismissRequest = { showDeleteConfirm = false }, title = { Text("刪除") }, text = { Text("確定刪除？") },
+            AlertDialog(onDismissRequest = { showDeleteConfirm = false }, title = { Text("刪除") },
+                text = { Text("確定刪除？") },
                 confirmButton = { Button(colors = ButtonDefaults.buttonColors(containerColor = Color.Red),
                     onClick = { context.deleteAccount(accountToDelete, isTW) { refreshList(); showDeleteConfirm = false } }) { Text("刪除", color = Color.White) } },
                 dismissButton = { TextButton(onClick = { showDeleteConfirm = false }) { Text("取消") } })
         }
 
         if (showResetConfirm) {
-            AlertDialog(
-                onDismissRequest = { showResetConfirm = false },
-                title = { Text("重置顏色") },
-                text = { Text("確定要將所有帳號的「今日已用」狀態重置嗎？\n(所有卡片將變回綠色)") },
+            AlertDialog(onDismissRequest = { showResetConfirm = false }, title = { Text("重置顏色") },
+                text = { Text("確定重置所有「今日已用」狀態？") },
                 confirmButton = { Button(onClick = { context.resetAllColors(isTW) { refreshList() }; showResetConfirm = false }) { Text("確定") } },
-                dismissButton = { TextButton(onClick = { showResetConfirm = false }) { Text("取消") } }
-            )
+                dismissButton = { TextButton(onClick = { showResetConfirm = false }) { Text("取消") } })
         }
 
         if (showLogDialog) {
-            AlertDialog(
-                onDismissRequest = { showLogDialog = false },
-                title = { Text("最近一次执行日志") },
+            AlertDialog(onDismissRequest = { showLogDialog = false }, title = { Text("最近日志") },
                 text = {
                     Box(modifier = Modifier.heightIn(max = 400.dp).verticalScroll(rememberScrollState())) {
-                        Text(text = context.lastOperationLog)
+                        Text(context.lastOperationLog)
                     }
                 },
                 confirmButton = { TextButton(onClick = { showLogDialog = false }) { Text("关闭") } },
-                dismissButton = { TextButton(onClick = { context.lastOperationLog = "暂无日志"; showLogDialog = false }) { Text("清空") } }
-            )
+                dismissButton = { TextButton(onClick = { context.lastOperationLog = "暂无日志"; showLogDialog = false }) { Text("清空") } })
+        }
+    }
+}
+
+// ★★★ 切換帳號輔助函數（樂觀更新版）★★★
+private fun doSwitch(
+    context: MainActivity,
+    model: AccountModel,
+    fullName: String,
+    isTW: Boolean,
+    prefs: android.content.SharedPreferences,
+    refreshList: () -> Unit
+) {
+    val localKey = "LAST_${if(isTW) "TW" else "JP"}"
+
+    // ★ 立即更新本地 UI（唔等 Firestore，卡片秒變藍）
+    prefs.edit()
+        .putString(localKey, model.getName())
+        .putLong("${localKey}_TIME", System.currentTimeMillis())
+        .apply()
+    refreshList()
+
+    // ★ 背景執行上鎖 + 切換
+    context.tryLockAndSwitch(fullName, isTW) { success, errorMsg ->
+        if (!success && errorMsg.isNotEmpty()) {
+            // 上鎖失敗 → 還原本地狀態
+            prefs.edit().remove(localKey).apply()
+            refreshList()
+            android.app.AlertDialog.Builder(context)
+                .setTitle("⚠️ 無法切換")
+                .setMessage(errorMsg)
+                .setPositiveButton("知道了", null)
+                .show()
         }
     }
 }
